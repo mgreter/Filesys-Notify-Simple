@@ -1,9 +1,11 @@
 META.yml
 Makefile
 inc/
+blib/
+t/x/
 pm_to_blib
 *~
 MYMETA.*
-/Filesys-Notify-Simple-*
+/Filesys-Notify-Light-*
 /.build
 !META.json

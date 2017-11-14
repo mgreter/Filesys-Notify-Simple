@@ -1,12 +1,12 @@
 # NAME
 
-Filesys::Notify::Simple - Simple and dumb file system watcher
+Filesys::Notify::Light - Light and simple file system watcher
 
 # SYNOPSIS
 
-    use Filesys::Notify::Simple;
+    use Filesys::Notify::Light;
 
-    my $watcher = Filesys::Notify::Simple->new([ "." ]);
+    my $watcher = Filesys::Notify::Light->new([ "." ]);
     $watcher->wait(sub {
         for my $event (@_) {
             $event->{path} # full path of the file updated
@@ -15,7 +15,7 @@ Filesys::Notify::Simple - Simple and dumb file system watcher
 
 # DESCRIPTION
 
-Filesys::Notify::Simple is a simple but unified interface to get
+Filesys::Notify::Light is a Light but unified interface to get
 notifications of changes to a given filesystem path. It utilizes
 inotify2 on Linux, fsevents on OS X, kqueue on FreeBSD and
 FindFirstChangeNotification on Windows if they're installed, with a
