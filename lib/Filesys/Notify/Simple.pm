@@ -54,8 +54,10 @@ sub wait_inotify2 {
     Linux::Inotify2->import;
     my $inotify = Linux::Inotify2->new;
 
+    my %watched;
     my $fs = _full_scan(@path);
     for my $path (keys %$fs) {
+        $watched{$path} = 1;
         $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
             or Carp::croak("watch failed: $!");
     }
@@ -64,7 +66,14 @@ sub wait_inotify2 {
         my $cb = shift;
         $inotify->blocking(1);
         my @events = $inotify->read;
-        $cb->(map { +{ path => $_->fullname } } @events);
+        @events = map { $_->fullname } @events;
+        foreach my $path (@events) {
+            next if exists $watched{$path} || ! -d $path;
+            $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
+                or Carp::croak("watch failed: $!");
+            $watched{$path} = 1;
+        }
+        $cb->(map { +{ path => $_ } } @events);
     };
 }
 
