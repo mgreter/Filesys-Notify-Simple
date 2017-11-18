@@ -349,7 +349,7 @@ __END__
 
 =head1 NAME
 
-Filesys::Notify::Simple - Simple and dumb file system watcher
+Filesys::Notify::Simple - Simple file system watcher
 
 =head1 SYNOPSIS
 
@@ -365,19 +365,15 @@ Filesys::Notify::Simple - Simple and dumb file system watcher
 =head1 DESCRIPTION
 
 Filesys::Notify::Simple is a simple but unified interface to get
-notifications of changes to a given filesystem path. It utilizes
-inotify2 on Linux, fsevents on OS X, kqueue on FreeBSD and
-FindFirstChangeNotification on Windows if they're installed, with a
-fallback to the full directory scan if they're not available.
+notifications of changes to a given filesystem path or for specific
+files. It utilizes inotify2 on Linux, Win32::ChangeNotify on Windows,
+KQueue on FreeBSD, OpenBSD, NetBSD and Mac OSX if they're installed,
+with a fallback to a full directory scan if they're not available.
 
 There are some limitations in this module. If you don't like it, use
 L<File::ChangeNotify>.
 
 =over 4
-
-=item *
-
-There is no file name based filter. Do it in your own code.
 
 =item *
 
@@ -389,10 +385,9 @@ Currently C<wait> method blocks.
 
 =back
 
-In return, this module doesn't depend on any non-core
-modules. Platform specific optimizations with L<Linux::Inotify2>,
-L<Mac::FSEvents>, L<Filesys::Notify::KQueue> and L<Win32::ChangeNotify>
-are truely optional.
+In return, this module doesn't depend on any non-core modules.
+Platform specific optimizations with L<Linux::Inotify2>,
+L<Win32::ChangeNotify> or L<Filesys::Notify::KQueue> are optional.
 
 NOTE: Using L<Win32::ChangeNotify> may put additional limitations.
 
@@ -400,15 +395,15 @@ NOTE: Using L<Win32::ChangeNotify> may put additional limitations.
 
 =item *
 
-L<Win32::ChangeNotify> uses FindFirstChangeNotificationA so that
-Unicode characters can not be handled.
-On cygwin (1.7 or later), Unicode characters should be able to be handled
-when L<Win32::ChangeNotify> is not used.
+L<Win32::ChangeNotify> uses FindFirstChangeNotificationA (the A stands
+for ANSI) so Unicode characters are not supported. On cygwin (1.7 or
+later), Unicode characters should be able to be handled when
+L<Win32::ChangeNotify> is not used.
 
 =item *
 
 If more than 64 directories are included under the specified paths,
-an error occurrs.
+an error occurs due to a limitation with the Windows API.
 
 =back
 
