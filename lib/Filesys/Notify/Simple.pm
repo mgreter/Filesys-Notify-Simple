@@ -48,18 +48,95 @@ sub init {
     }
 }
 
+sub get_observers {
+    my @path = @_;
+
+    require File::Basename;
+    @path = map { Cwd::abs_path($_) } @path;
+    my (%observer, @dirs, @files, @roots);
+
+    # split up watcher paths
+    foreach my $path (@path) {
+        if (-f $path) { push @files, $path; }
+        elsif (-d $path) { push @dirs, $path; }
+    }
+
+    # get rid of inner paths
+    # no need to observer twice
+    foreach my $path (@dirs) {
+        my $hasroot = undef;
+        foreach my $root (@roots) {
+            # check if path starts with root (is subpath)
+            if (substr($path, 0, length($root)) eq $root) {
+                $hasroot = $root;
+                last;
+            }
+        }
+        push @roots, $path unless $hasroot;
+    }
+
+    # observe directories recursively
+    foreach my $path (@dirs) {
+        if (exists $observer{$path}) {
+            $observer{$path}->{isdir} = 1;
+        } else {
+            $observer{$path} = {
+                files => [],
+                isdir => 1
+            };
+        }
+    }
+
+    # observe files explicitly, but only if
+    # base directory is not watched recursively
+    foreach my $file (@files) {
+        my $path = File::Basename::dirname($file);
+        if (exists $observer{$path}) {
+            push @{$observer{$path}->{files}}, $file;
+        } else {
+            $observer{$path} = {
+                files => [$file],
+                isdir => 0
+            };
+        }
+    }
+
+    # optimize scan targets for observer
+    foreach my $path (keys %observer) {
+        $observer{$path}->{scan} = $observer{$path}->{isdir}
+            ? [ $path ] : \ @{$observer{$path}->{files}};
+    }
+
+    return %observer;
+}
+
 sub wait_inotify2 {
     my @path = @_;
 
     Linux::Inotify2->import;
     my $inotify = Linux::Inotify2->new;
+    my %observer = get_observers(@path);
 
     my %watched;
-    my $fs = _full_scan(@path);
-    for my $path (keys %$fs) {
-        $watched{$path} = 1;
-        $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
-            or Carp::croak("watch failed: $!");
+
+    foreach my $observer (keys %observer) {
+
+        my @paths;
+
+        if ($observer{$observer}->{isdir}) {
+            @paths = @{$observer{$observer}->{scan}};
+            @paths = keys %{_full_scan(@paths)};
+        }
+        else {
+            @paths = @{$observer{$observer}->{files}};
+        }
+
+        foreach my $path (@paths) {
+            $watched{$path} = 1;
+            $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
+                or Carp::croak("watch failed: $!");
+        }
+
     }
 
     return sub {
@@ -129,61 +206,7 @@ sub mk_wait_win32 {
     return sub {
         my @path = @_;
 
-        require File::Basename;
-        @path = map { Cwd::abs_path($_) } @path;
-        my (%observer, @dirs, @files, @roots);
-
-        # split up watcher paths
-        foreach my $path (@path) {
-            if (-f $path) { push @files, $path; }
-            elsif (-d $path) { push @dirs, $path; }
-        }
-
-        # get rid of inner paths
-        # no need to observer twice
-        foreach my $path (@dirs) {
-            my $hasroot = undef;
-            foreach my $root (@roots) {
-                # check if path starts with root (is subpath)
-                if (substr($path, 0, length($root)) eq $root) {
-                    $hasroot = $root;
-                    last;
-                }
-            }
-            push @roots, $path unless $hasroot;
-        }
-
-        # observe directories recursively
-        foreach my $path (@dirs) {
-            if (exists $observer{$path}) {
-                $observer{$path}->{isdir} = 1;
-            } else {
-                $observer{$path} = {
-                    files => [],
-                    isdir => 1
-                };
-            }
-        }
-
-        # observe files explicitly, but only if
-        # base directory is not watched recursively
-        foreach my $file (@files) {
-            my $path = File::Basename::dirname($file);
-            if (exists $observer{$path}) {
-                push @{$observer{$path}->{files}}, $path
-            } else {
-                $observer{$path} = {
-                    files => [$path],
-                    isdir => 0
-                };
-            }
-        }
-
-        # optimize scan targets for observer
-        foreach my $path (keys %observer) {
-            $observer{$path}->{scan} = $observer{$path}->{isdir}
-                ? [ $path ] : \ @{$observer{$path}->{files}};
-        }
+        my %observer = get_observers(@path);
 
         # either scan the whole directory or only the necessary files
         my @scan = map { @{$observer{$_}->{scan}} } keys %observer;
