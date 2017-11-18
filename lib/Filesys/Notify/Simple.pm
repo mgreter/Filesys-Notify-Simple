@@ -344,6 +344,13 @@ sub _full_scan {
             no_chdir => 1,
         }, $path);
 
+my $asd = File::Spec->rel2abs($fp);
+my $qwe = Cwd::realpath(File::Basename::dirname($fp));
+unless (exists ($map{$path}{$asd})) {
+    $map{$path}{$asd} = undef;
+    warn $fp;
+}
+
         # remove root entry
         # NOTE: On MSWin32, realpath and rel2abs disagree with path separator.
         delete $map{$fp}{File::Spec->rel2abs($fp)} if exists $map{$fp};
