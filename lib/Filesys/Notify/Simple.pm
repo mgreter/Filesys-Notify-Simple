@@ -35,6 +35,8 @@ sub init {
     local $@;
     if ($^O eq 'linux' && !NO_OPT && eval { require Linux::Inotify2; 1 }) {
         $self->{watcher_cb} = \&wait_inotify2;
+    } elsif ($^O eq 'darwin' && !NO_OPT && eval { require Filesys::Notify::KQueue; 1 }) {
+        $self->{watcher_cb} = \&wait_kqueue;
     } elsif ($^O eq 'darwin' && !NO_OPT && eval { require Mac::FSEvents; 1 }) {
         $self->{watcher_cb} = \&wait_fsevents;
     } elsif ($^O =~ m/^(?:free|open|net)bsd$/ && !NO_OPT && eval { require Filesys::Notify::KQueue; 1 }) {
