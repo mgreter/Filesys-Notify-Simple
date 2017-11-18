@@ -18,8 +18,6 @@ our %watchers = (
     'openbsd' => [ 'Filesys::Notify::KQueue', \&wait_kqueue, 0.01 ]
 );
 
-# flag to disable platform optimizations
-use constant NO_OPT => $ENV{PERL_FNS_NO_OPT};
 use constant IS_CYGWIN => $^O eq "cygwin";
 
 # core modules
@@ -45,6 +43,7 @@ sub init
     my ($self) = @_;
     local $@; # preserver errors
     $self->{watcher_cb} = \&wait_timer;
+    return $self if $ENV{PERL_FNS_NO_OPT};
     if (my $watcher = $watchers{lc $^O}) {
         if (eval "require $watcher->[0]; 1") {
             $self->{watcher_cb} = $watcher->[1];
@@ -135,10 +134,15 @@ sub get_observers
 sub wait_kqueue {
     my ($self) = @_;
 
-    my $kqueue = Filesys::Notify::KQueue->new(
-        timeout => $self->{timeout},
+    my %opt = (
         path => $self->{paths},
     );
+
+    if (defined $self->{timeout}) {
+        $opt{timeout} = $self->{timeout}
+    }
+
+    my $kqueue = Filesys::Notify::KQueue->new(%opt);
 
     return sub {
         my ($cb) = @_;
@@ -160,13 +164,14 @@ sub wait_win32 {
     # get current filesystem state
     my $fs = _full_scan(@scan);
 
-    my (@notify, @fskey);
+    my (@notify, @observer, @fs_state);
 
     for my $path (keys %{$observers}) {
         my $winpath = IS_CYGWIN ? Cygwin::posix_to_win_path($path) : $path;
         # 0x1b means 'DIR_NAME|FILE_NAME|LAST_WRITE|SIZE' = 2|1|0x10|8
         push @notify, Win32::ChangeNotify->new($winpath, $observers->{$path}->{isdir}, 0x1b);
-        push @fskey, $path;
+        push @fs_state, _full_scan(@{$observers->{$path}->{scan}});
+        push @observer, $observers->{$path};
     }
 
     return sub {
@@ -180,7 +185,8 @@ sub wait_win32 {
             if($idx > 0) {
                 --$idx;
                 # get all file changes for observed path
-                my $observer = $observers->{$fskey[$idx]};
+                my $old_fs = $fs_state[$idx];
+                my $observer = $observer[$idx];
                 my $new_fs = _full_scan(@{$observer->{scan}});
                 # on windows we can only watch folders
                 # therefore we need to filter unwanted
@@ -198,15 +204,14 @@ sub wait_win32 {
                         }
                     }
                 }
-                $notify[$idx]->reset;
-                my $old_fs = { map { ($_ => $fs->{$_}) } keys %$new_fs };
-                my $cb = sub { push @events, { path => $_[0], type => $_[1] }; };
+                my $cb = sub { push @events, { path => $_[0], event => $_[1] }; };
                 _compare_fs($old_fs, $new_fs, $cb);
-                $fs->{$_} = $new_fs->{$_} for keys %$new_fs;
+                $fs_state[$idx] = $new_fs; # update state
+                $notify[$idx]->reset; # reset watcher
                 last if @events; # Actually changed
             }
         }
-        $cb->(@events);
+        $cb->(@events) if @events;
     }
 
 }
@@ -271,7 +276,7 @@ sub wait_inotify2
                 Carp::croak("watch failed: $!");
             $watched{$path} = 1;
         }
-        $cb->(map { +{ path => $_->fullname, type => _inotify2_type($_) } } @events);
+        $cb->(map { +{ path => $_->fullname, event => _inotify2_type($_) } } @events);
     };
 
 }
@@ -280,7 +285,9 @@ sub wait_inotify2
 # Pure perl fallback
 sub wait_timer
 {
-    my @path = @_;
+    my ($self) = @_;
+
+    my @path = @{$self->{paths}};
 
     my $fs = _full_scan(@path);
 
@@ -290,9 +297,9 @@ sub wait_timer
         my @events;
         while (1) {
             # sleep 0 is needed to fix sigalrm on windows!?
-            select undef, undef, undef, $interval && sleep 0;
+            select(undef, undef, undef, $interval) && sleep 0;
             my $new_fs = _full_scan(@path);
-            my $cb = sub { push @events, { path => $_[0], type => $_[1] }; };
+            my $cb = sub { push @events, { path => $_[0], event => $_[1] }; };
             _compare_fs($fs, $new_fs, $cb);
             $fs = $new_fs;
             last if @events;
@@ -337,32 +344,30 @@ sub _full_scan {
             wanted => sub {
                 my $fullname = $File::Find::fullname || File::Spec->rel2abs($File::Find::name);
                 my $stat = $map{Cwd::realpath($File::Find::dir)}{$fullname} = _stat($fullname);
-                $map{$path}{$fullname} = $stat if $stat->{is_dir}; # keep track of directories
+                $map{$path}{$fullname} = $stat if $stat && $stat->{is_dir}; # keep track of directories
             },
             follow_fast => 1,
             follow_skip => 2,
             no_chdir => 1,
         }, $path);
 
-my $asd = File::Spec->rel2abs($fp);
-my $qwe = Cwd::realpath(File::Basename::dirname($fp));
-unless (exists ($map{$path}{$asd})) {
-    $map{$path}{$asd} = undef;
-    warn $fp;
-}
-
-        # remove root entry
         # NOTE: On MSWin32, realpath and rel2abs disagree with path separator.
-        delete $map{$fp}{File::Spec->rel2abs($fp)} if exists $map{$fp};
+        # delete $map{$fp}{File::Spec->rel2abs($fp)} if exists $map{$fp};
     }
 
     return \%map;
 }
 
 sub _stat {
-    my $path = shift;
+    my ($path) = @_;
+    return undef unless -e $path;
     my @stat = stat $path;
-    return { path => $path, mtime => $stat[9], size => $stat[7], is_dir => -d _ };
+    return {
+        path => $path,
+        mtime => $stat[9],
+        size => $stat[7],
+        is_dir => -d _,
+    };
 }
 
 
