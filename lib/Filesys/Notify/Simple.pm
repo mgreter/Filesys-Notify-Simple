@@ -1,290 +1,344 @@
 package Filesys::Notify::Simple;
 
 use strict;
+use warnings;
+
 use 5.008_001;
 our $VERSION = '0.12';
 our $interval = 2.0;
 
-use Carp ();
-use Cwd;
-use constant NO_OPT => $ENV{PERL_FNS_NO_OPT};
+# list watchers per OS
+our %watchers = (
+    'linux' => [ 'Linux::Inotify2', \&wait_inotify2, 0.01 ],
+    'cygwin' => [ 'Win32::ChangeNotify', \&wait_win32, 0.01 ],
+    'mswin32' => [ 'Win32::ChangeNotify', \&wait_win32, 0.01 ],
+    'darwin' => [ 'Filesys::Notify::KQueue', \&wait_kqueue, 0.01 ],
+    'netbsd' => [ 'Filesys::Notify::KQueue', \&wait_kqueue, 0.01 ],
+    'freebsd' => [ 'Filesys::Notify::KQueue', \&wait_kqueue, 0.01 ],
+    'openbsd' => [ 'Filesys::Notify::KQueue', \&wait_kqueue, 0.01 ]
+);
 
-sub new {
+use constant IS_CYGWIN => $^O eq "cygwin";
+
+# core modules
+use Cwd qw();
+use Carp qw();
+use File::Find qw();
+use File::Basename qw();
+
+# create new instance
+sub new
+{
     my($class, $path) = @_;
-
-    unless (ref $path eq 'ARRAY') {
-        Carp::croak('Usage: Filesys::Notify::Simple->new([ $path1, $path2 ])');
-    }
-
+    Carp::croak('Usage: Filesys::Notify::Simple->new([ $path1, $path2 ])')
+        unless (ref $path eq 'ARRAY' && scalar(@_) == 2);
     my $self = bless { paths => $path }, $class;
-    $self->init;
-
-    $self;
+    return $self->init;
 }
+# EO new
 
-sub wait {
-    my($self, $cb) = @_;
+# choose file watcher
+sub init
+{
+    my ($self) = @_;
+    local $@; # preserver errors
+    $self->{watcher_cb} = \&wait_timer;
+    return $self if $ENV{PERL_FNS_NO_OPT};
+    if (my $watcher = $watchers{lc $^O}) {
+        if (eval "require $watcher->[0]; 1") {
+            $self->{watcher_cb} = $watcher->[1];
+        }
+    }
+    return $self;
+}
+# EO init
 
-    $self->{watcher} ||= $self->{watcher_cb}->(@{$self->{paths}});
+# main blocking wait method
+sub wait
+{
+    my($self, $cb, $timeout) = @_;
+    # store blocking timeout
+    $self->{timeout} = $timeout;
+    # instantiate the platform specific watcher function once
+    $self->{watcher} ||= $self->{watcher_cb}->($self);
+    # call watcher function
     $self->{watcher}->($cb);
 }
+# EO wait
 
-sub init {
-    my $self = shift;
-
-    local $@;
-    if ($^O eq 'linux' && !NO_OPT && eval { require Linux::Inotify2; 1 }) {
-        $self->{watcher_cb} = \&wait_inotify2;
-    } elsif ($^O eq 'darwin' && !NO_OPT && eval { require Mac::FSEvents; 1 }) {
-        $self->{watcher_cb} = \&wait_fsevents;
-    } elsif ($^O =~ m/^(?:free|open|net)bsd$/ && !NO_OPT && eval { require Filesys::Notify::KQueue; 1 }) {
-        $self->{watcher_cb} = \&wait_kqueue;
-    } elsif ($^O eq 'MSWin32' && !NO_OPT && eval { require Win32::ChangeNotify; 1 }) {
-        $self->{watcher_cb} = mk_wait_win32(0); # Not cygwin
-    } elsif ($^O eq 'cygwin' && !NO_OPT && eval { require Win32::ChangeNotify; 1 }) {
-        $self->{watcher_cb} = mk_wait_win32(1); # Cygwin
-    } else {
-        $self->{watcher_cb} = \&wait_timer;
-    }
-}
-
-sub wait_inotify2 {
+# return observers struct
+sub get_observers
+{
     my @path = @_;
 
-    Linux::Inotify2->import;
-    my $inotify = Linux::Inotify2->new;
+    my (%observer, @dirs, @files, @roots);
+    @path = map { Cwd::abs_path($_) } @path;
 
-    my %watched;
-    my $fs = _full_scan(@path);
-    for my $path (keys %$fs) {
-        $watched{$path} = 1;
-        $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
-            or Carp::croak("watch failed: $!");
+    # split up watcher paths
+    foreach my $path (@path) {
+        if (-f $path) { push @files, $path; }
+        elsif (-d $path) { push @dirs, $path; }
     }
 
-    return sub {
-        my $cb = shift;
-        $inotify->blocking(1);
-        my @events = $inotify->read;
-        @events = map { $_->fullname } @events;
-        foreach my $path (@events) {
-            next if exists $watched{$path} || ! -d $path;
-            $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
-                or Carp::croak("watch failed: $!");
-            $watched{$path} = 1;
+    # get rid of inner paths
+    # no need to observer twice
+    foreach my $path (@dirs) {
+        my $hasroot = undef;
+        foreach my $root (@roots) {
+            # check if path starts with root (is subpath)
+            if (substr($path, 0, length($root)) eq $root) {
+                $hasroot = $root;
+                last;
+            }
         }
-        $cb->(map { +{ path => $_ } } @events);
-    };
-}
-
-sub wait_fsevents {
-    require IO::Select;
-    my @path = @_;
-
-    my $fs = _full_scan(@path);
-    my $sel = IO::Select->new;
-
-    my %events;
-    for my $path (@path) {
-        my $fsevents = Mac::FSEvents->new({ path => $path, latency => 1 });
-        my $fh = $fsevents->watch;
-        $sel->add($fh);
-        $events{fileno $fh} = $fsevents;
+        push @roots, $path unless $hasroot;
     }
 
-    return sub {
-        my $cb = shift;
-
-        my @ready = $sel->can_read;
-        my @events;
-        for my $fh (@ready) {
-            my $fsevents = $events{fileno $fh};
-            my %uniq;
-            my @path = grep !$uniq{$_}++, map { $_->path } $fsevents->read_events;
-
-            my $new_fs = _full_scan(@path);
-            my $old_fs = +{ map { ($_ => $fs->{$_}) } keys %$new_fs };
-            _compare_fs($old_fs, $new_fs, sub { push @events, { path => $_[0] } });
-            $fs->{$_} = $new_fs->{$_} for keys %$new_fs;
-            last if @events;
+    # observe directories recursively
+    foreach my $path (@dirs) {
+        if (exists $observer{$path}) {
+            $observer{$path}->{isdir} = 1;
+        } else {
+            $observer{$path} = {
+                files => [],
+                isdir => 1
+            };
         }
+    }
 
-        $cb->(@events);
-    };
+    # observe files explicitly, but only if
+    # base directory is not watched recursively
+    foreach my $file (@files) {
+        my $path = File::Basename::dirname($file);
+        if (exists $observer{$path}) {
+            push @{$observer{$path}->{files}}, $file;
+        } else {
+            $observer{$path} = {
+                files => [$file],
+                isdir => 0
+            };
+        }
+    }
+
+    # optimize scan targets for observer
+    foreach my $path (keys %observer) {
+        $observer{$path}->{scan} = $observer{$path}->{isdir}
+            ? [ $path ] : \ @{$observer{$path}->{files}};
+    }
+
+    return \ %observer;
 }
+# EO get_observers
 
+# NetBSD, FreeBSD, OpenBSD and Mac OSX
 sub wait_kqueue {
-    my @path = @_;
+    my ($self) = @_;
 
-    my $kqueue = Filesys::Notify::KQueue->new(
-        path => \@path
+    my %opt = (
+        path => $self->{paths},
     );
 
-    return sub { $kqueue->wait(shift) };
-}
+    if (defined $self->{timeout}) {
+        $opt{timeout} = $self->{timeout}
+    }
 
-sub mk_wait_win32 {
-    my ($is_cygwin) = @_;
+    my $kqueue = Filesys::Notify::KQueue->new(%opt);
 
     return sub {
-        my @path = @_;
+        my ($cb) = @_;
+        $kqueue->wait($cb)
+    };
+}
+# EO wait_kqueue
 
-        require File::Basename;
-        @path = map { Cwd::abs_path($_) } @path;
-        my (%observer, @dirs, @files, @roots);
+# Windows and CYGWIN
+sub wait_win32 {
 
-        # split up watcher paths
-        foreach my $path (@path) {
-            if (-f $path) { push @files, $path; }
-            elsif (-d $path) { push @dirs, $path; }
-        }
+    my ($self) = @_;
 
-        # get rid of inner paths
-        # no need to observer twice
-        foreach my $path (@dirs) {
-            my $hasroot = undef;
-            foreach my $root (@roots) {
-                # check if path starts with root (is subpath)
-                if (substr($path, 0, length($root)) eq $root) {
-                    $hasroot = $root;
-                    last;
-                }
-            }
-            push @roots, $path unless $hasroot;
-        }
+    my $observers = get_observers(@{$self->{paths}});
 
-        # observe directories recursively
-        foreach my $path (@dirs) {
-            if (exists $observer{$path}) {
-                $observer{$path}->{isdir} = 1;
-            } else {
-                $observer{$path} = {
-                    files => [],
-                    isdir => 1
-                };
-            }
-        }
+    # either scan the whole directory or only the necessary files
+    my @scan = map { @{$observers->{$_}->{scan}} } keys %{$observers};
 
-        # observe files explicitly, but only if
-        # base directory is not watched recursively
-        foreach my $file (@files) {
-            my $path = File::Basename::dirname($file);
-            if (exists $observer{$path}) {
-                push @{$observer{$path}->{files}}, $path
-            } else {
-                $observer{$path} = {
-                    files => [$path],
-                    isdir => 0
-                };
-            }
-        }
+    # get current filesystem state
+    my $fs = _full_scan(@scan);
 
-        # optimize scan targets for observer
-        foreach my $path (keys %observer) {
-            $observer{$path}->{scan} = $observer{$path}->{isdir}
-                ? [ $path ] : \ @{$observer{$path}->{files}};
-        }
+    my (@notify, @observer, @fs_state);
 
-        # either scan the whole directory or only the necessary files
-        my @scan = map { @{$observer{$_}->{scan}} } keys %observer;
+    for my $path (keys %{$observers}) {
+        my $winpath = IS_CYGWIN ? Cygwin::posix_to_win_path($path) : $path;
+        # 0x1b means 'DIR_NAME|FILE_NAME|LAST_WRITE|SIZE' = 2|1|0x10|8
+        push @notify, Win32::ChangeNotify->new($winpath, $observers->{$path}->{isdir}, 0x1b);
+        push @fs_state, _full_scan(@{$observers->{$path}->{scan}});
+        push @observer, $observers->{$path};
+    }
 
-        # get current filesystem state
-        my $fs = _full_scan(@scan);
+    return sub {
 
-        my (@notify, @fskey);
+        my ($cb) = @_;
 
-        for my $path (keys %observer) {
-            my $winpath = $is_cygwin ? Cygwin::posix_to_win_path($path) : $path;
-            # 0x1b means 'DIR_NAME|FILE_NAME|LAST_WRITE|SIZE' = 2|1|0x10|8
-            push @notify, Win32::ChangeNotify->new($winpath, $observer{$path}->{isdir}, 0x1b);
-            push @fskey, $path;
-        }
-
-        return sub {
-            my $cb = shift;
-
-            my @events;
-            while(1) {
-                my $idx = Win32::ChangeNotify::wait_any(\@notify); 
-                Carp::croak("Can't wait notifications, maybe " . scalar(@notify) . " directories exceeds limitation.") if ! defined $idx;
-                if($idx > 0) {
-                    --$idx;
-                    # get all file changes for observed path
-                    my $observer = $observer{$fskey[$idx]};
-                    my $new_fs = _full_scan(@{$observer->{scan}});
-                    # on windows we can only watch folders
-                    # therefore we need to filter unwanted
-                    # events for files we are not looking for
-                    # but only if we don't watch folder itself
-                    unless ($observer->{isdir}) {
-                        foreach my $root (keys %{$new_fs}) {
-                            # process all reported file changes in path
-                            foreach my $file (keys %{$new_fs->{$root}}) {
-                                # don't remove if we watch particular file
-                                unless (exists $fs->{$root}->{$file}) {
-                                    # we are not interested in this event
-                                    delete $new_fs->{$root}->{$file};
-                                }
+        my @events;
+        while(1) {
+            my $idx = Win32::ChangeNotify::wait_any(\@notify, $self->{timeout}); 
+            Carp::croak("Can't wait notifications, maybe " . scalar(@notify) . " directories exceeds limitation.") if ! defined $idx;
+            if($idx > 0) {
+                --$idx;
+                # get all file changes for observed path
+                my $old_fs = $fs_state[$idx];
+                my $observer = $observer[$idx];
+                my $new_fs = _full_scan(@{$observer->{scan}});
+                # on windows we can only watch folders
+                # therefore we need to filter unwanted
+                # events for files we are not looking for
+                # but only if we don't watch folder itself
+                unless ($observer->{isdir}) {
+                    foreach my $root (keys %{$new_fs}) {
+                        # process all reported file changes in path
+                        foreach my $file (keys %{$new_fs->{$root}}) {
+                            # don't remove if we watch particular file
+                            unless (exists $fs->{$root}->{$file}) {
+                                # we are not interested in this event
+                                delete $new_fs->{$root}->{$file};
                             }
                         }
                     }
-                    $notify[$idx]->reset;
-                    my $old_fs = +{ map { ($_ => $fs->{$_}) } keys %$new_fs };
-                    _compare_fs($old_fs, $new_fs, sub { push @events, { path => $_[0] } });
-                    $fs->{$_} = $new_fs->{$_} for keys %$new_fs;
-                    last if @events; # Actually changed
                 }
+                my $cb = sub { push @events, { path => $_[0], event => $_[1] }; };
+                _compare_fs($old_fs, $new_fs, $cb);
+                $fs_state[$idx] = $new_fs; # update state
+                $notify[$idx]->reset; # reset watcher
+                last if @events; # Actually changed
             }
-            $cb->(@events);
         }
+        $cb->(@events) if @events;
     }
-}
 
-sub wait_timer {
-    my @path = @_;
+}
+# EO mk_wait_win32
+
+# translate event types
+sub _inotify2_type
+{
+    my ($event) = @_;
+    return "create" if $event->IN_CREATE;
+    return "delete" if $event->IN_DELETE;
+    return "delete" if $event->IN_DELETE_SELF;
+    return "modify"; # default case
+}
+# EO _inotify2_type
+
+# Linux
+sub wait_inotify2
+{
+    my ($self) = @_;
+
+    my @path = @{$self->{paths}};
+
+    my $wmode = 
+        Linux::Inotify2::IN_MOVE() |
+        Linux::Inotify2::IN_MODIFY() |
+        Linux::Inotify2::IN_CREATE() |
+        Linux::Inotify2::IN_DELETE() |
+        Linux::Inotify2::IN_MOVE_SELF() |
+        Linux::Inotify2::IN_DELETE_SELF();
+
+    my $inotify = Linux::Inotify2->new;
+    my $observers = get_observers(@path);
+
+    my %watched;
+
+    foreach my $observer (keys %{$observers}) {
+
+        my @paths;
+
+        if ($observers->{$observer}->{isdir}) {
+            @paths = @{$observers->{$observer}->{scan}};
+            @paths = keys %{_full_scan(@paths)};
+        }
+        else {
+            @paths = @{$observers->{$observer}->{files}};
+        }
+
+        foreach my $path (@paths) {
+            $inotify->watch($path, $wmode) or
+                Carp::croak("watch failed: $!");
+            $watched{$path} = 1;
+        }
+
+    }
+
+    # return watcher sub
+    return sub {
+        my ($cb) = @_;
+        $inotify->blocking(1);
+        my @events = $inotify->read;
+        foreach my $path (map { $_->fullname } @events) {
+            next if exists $watched{$path} || ! -d $path;
+            $inotify->watch($path, $wmode) or
+                Carp::croak("watch failed: $!");
+            $watched{$path} = 1;
+        }
+        $cb->(map { +{ path => $_->fullname, event => _inotify2_type($_) } } @events);
+    };
+
+}
+# EO wait_inotify2
+
+# Pure perl fallback
+sub wait_timer
+{
+    my ($self) = @_;
+
+    my @path = @{$self->{paths}};
 
     my $fs = _full_scan(@path);
 
+    # return watcher sub
     return sub {
-        my $cb = shift;
+        my ($cb) = @_;
         my @events;
         while (1) {
             # sleep 0 is needed to fix sigalrm on windows!?
-            select undef, undef, undef, $interval && sleep 0;
+            select(undef, undef, undef, $interval); sleep 0;
             my $new_fs = _full_scan(@path);
-            _compare_fs($fs, $new_fs, sub { push @events, { path => $_[0] } });
+            my $cb = sub { push @events, { path => $_[0], event => $_[1] }; };
+            _compare_fs($fs, $new_fs, $cb);
             $fs = $new_fs;
             last if @events;
         };
         $cb->(@events);
     };
 }
+# EO wait_timer
 
-sub _compare_fs {
+# compare fs states
+sub _compare_fs
+{
     my($old, $new, $cb) = @_;
 
     for my $dir (keys %$old) {
         for my $path (keys %{$old->{$dir}}) {
             if (!exists $new->{$dir}{$path}) {
-                $cb->($path); # deleted
+                $cb->($path, 'delete');
             } elsif (!$new->{$dir}{$path}{is_dir} &&
                     ( $old->{$dir}{$path}{mtime} != $new->{$dir}{$path}{mtime} ||
                       $old->{$dir}{$path}{size}  != $new->{$dir}{$path}{size})) {
-                $cb->($path); # updated
+                $cb->($path, 'modify');
             }
         }
     }
 
     for my $dir (keys %$new) {
         for my $path (sort grep { !exists $old->{$dir}{$_} } keys %{$new->{$dir}}) {
-            $cb->($path); # new
+            $cb->($path, 'create');
         }
     }
 }
+# _compare_fs
 
 sub _full_scan {
     my @paths = @_;
-    require File::Find;
 
     my %map;
     for my $path (@paths) {
@@ -293,25 +347,30 @@ sub _full_scan {
             wanted => sub {
                 my $fullname = $File::Find::fullname || File::Spec->rel2abs($File::Find::name);
                 my $stat = $map{Cwd::realpath($File::Find::dir)}{$fullname} = _stat($fullname);
-                $map{$path}{$fullname} = $stat if $stat->{is_dir}; # keep track of directories
+                $map{$path}{$fullname} = $stat if $stat && $stat->{is_dir}; # keep track of directories
             },
             follow_fast => 1,
             follow_skip => 2,
             no_chdir => 1,
         }, $path);
 
-        # remove root entry
         # NOTE: On MSWin32, realpath and rel2abs disagree with path separator.
-        delete $map{$fp}{File::Spec->rel2abs($fp)} if exists $map{$fp};
+        # delete $map{$fp}{File::Spec->rel2abs($fp)} if exists $map{$fp};
     }
 
     return \%map;
 }
 
 sub _stat {
-    my $path = shift;
+    my ($path) = @_;
+    return undef unless -e $path;
     my @stat = stat $path;
-    return { path => $path, mtime => $stat[9], size => $stat[7], is_dir => -d _ };
+    return {
+        path => $path,
+        mtime => $stat[9],
+        size => $stat[7],
+        is_dir => -d _,
+    };
 }
 
 
@@ -349,10 +408,6 @@ There are some limitations in this module. If you don't like it, use
 L<File::ChangeNotify>.
 
 =over 4
-
-=item *
-
-You can not get types of events (created, updated, deleted).
 
 =item *
 
@@ -397,3 +452,5 @@ L<File::ChangeNotify> L<Mac::FSEvents> L<Linux::Inotify2> L<Filesys::Notify::KQu
 L<Win32::ChangeNotify>
 
 =cut
+
+# directories are watched recursively
