@@ -46,7 +46,7 @@ sub init
     local $@; # preserver errors
     $self->{watcher_cb} = \&wait_timer;
     if (my $watcher = $watchers{lc $^O}) {
-        if (eval { require $watcher->[0]; 1 }) {
+        if (eval "require $watcher->[0]; 1") {
             $self->{watcher_cb} = $watcher->[1];
         }
     }
@@ -137,7 +137,10 @@ sub wait_kqueue {
         path => \@path
     );
 
-    return sub { $kqueue->wait(shift) };
+    return sub {
+        my ($cb) = @_;
+        $kqueue->wait($cb)
+    };
 }
 # EO wait_kqueue
 
@@ -206,17 +209,29 @@ sub mk_wait_win32 {
 }
 # EO mk_wait_win32
 
+# translate event types
 sub _inotify2_type
 {
     my ($event) = @_;
+    return "create" if $event->IN_CREATE;
+    return "delete" if $event->IN_DELETE;
+    return "modify"; # default case
 }
+# EO _inotify2_type
 
 # Linux
 sub wait_inotify2
 {
     my @path = @_;
 
-    Linux::Inotify2->import;
+    my $wmode = 
+        Linux::Inotify2::IN_MOVE() |
+        Linux::Inotify2::IN_MODIFY() |
+        Linux::Inotify2::IN_CREATE() |
+        Linux::Inotify2::IN_DELETE() |
+        Linux::Inotify2::IN_MOVE_SELF() |
+        Linux::Inotify2::IN_DELETE_SELF();
+
     my $inotify = Linux::Inotify2->new;
     my $observers = get_observers(@path);
 
@@ -235,26 +250,27 @@ sub wait_inotify2
         }
 
         foreach my $path (@paths) {
-            $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
-                or Carp::croak("watch failed: $!");
+            $inotify->watch($path, $wmode) or
+                Carp::croak("watch failed: $!");
             $watched{$path} = 1;
         }
 
     }
 
+    # return watcher sub
     return sub {
-        my $cb = shift;
+        my ($cb) = @_;
         $inotify->blocking(1);
         my @events = $inotify->read;
-        my @paths = map { $_->fullname } @events;
-        foreach my $path (@paths) {
+        foreach my $path (map { $_->fullname } @events) {
             next if exists $watched{$path} || ! -d $path;
-            $inotify->watch($path, &IN_MODIFY|&IN_CREATE|&IN_DELETE|&IN_DELETE_SELF|&IN_MOVE_SELF|&IN_MOVE)
-                or Carp::croak("watch failed: $!");
+            $inotify->watch($path, $wmode) or
+                Carp::croak("watch failed: $!");
             $watched{$path} = 1;
         }
-        $cb->(map { { path => $_->fullname, type => _inotify2_type($_) } } @events);
+        $cb->(map { +{ path => $_->fullname, type => _inotify2_type($_) } } @events);
     };
+
 }
 # EO wait_inotify2
 
@@ -265,8 +281,9 @@ sub wait_timer
 
     my $fs = _full_scan(@path);
 
+    # return watcher sub
     return sub {
-        my $cb = shift;
+        my ($cb) = @_;
         my @events;
         while (1) {
             # sleep 0 is needed to fix sigalrm on windows!?
@@ -294,7 +311,7 @@ sub _compare_fs
             } elsif (!$new->{$dir}{$path}{is_dir} &&
                     ( $old->{$dir}{$path}{mtime} != $new->{$dir}{$path}{mtime} ||
                       $old->{$dir}{$path}{size}  != $new->{$dir}{$path}{size})) {
-                $cb->($path, 'update');
+                $cb->($path, 'modify');
             }
         }
     }
@@ -373,10 +390,6 @@ There are some limitations in this module. If you don't like it, use
 L<File::ChangeNotify>.
 
 =over 4
-
-=item *
-
-You can not get types of events (created, updated, deleted).
 
 =item *
 
