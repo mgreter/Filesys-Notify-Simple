@@ -57,9 +57,11 @@ sub init
 # main blocking wait method
 sub wait
 {
-    my($self, $cb) = @_;
+    my($self, $cb, $timeout) = @_;
+    # store blocking timeout
+    $self->{timeout} = $timeout;
     # instantiate the platform specific watcher function once
-    $self->{watcher} ||= $self->{watcher_cb}->(@{$self->{paths}});
+    $self->{watcher} ||= $self->{watcher_cb}->($self);
     # call watcher function
     $self->{watcher}->($cb);
 }
@@ -131,10 +133,11 @@ sub get_observers
 
 # NetBSD, FreeBSD, OpenBSD and Mac OSX
 sub wait_kqueue {
-    my @path = @_;
+    my ($self) = @_;
 
     my $kqueue = Filesys::Notify::KQueue->new(
-        path => \@path
+        timeout => $self->{timeout},
+        path => $self->{paths},
     );
 
     return sub {
@@ -145,11 +148,11 @@ sub wait_kqueue {
 # EO wait_kqueue
 
 # Windows and CYGWIN
-sub mk_wait_win32 {
+sub wait_win32 {
 
-    my @path = @_;
+    my ($self) = @_;
 
-    my $observers = get_observers(@path);
+    my $observers = get_observers(@{$self->{paths}});
 
     # either scan the whole directory or only the necessary files
     my @scan = map { @{$observers->{$_}->{scan}} } keys %{$observers};
@@ -172,7 +175,7 @@ sub mk_wait_win32 {
 
         my @events;
         while(1) {
-            my $idx = Win32::ChangeNotify::wait_any(\@notify); 
+            my $idx = Win32::ChangeNotify::wait_any(\@notify, $self->{timeout}); 
             Carp::croak("Can't wait notifications, maybe " . scalar(@notify) . " directories exceeds limitation.") if ! defined $idx;
             if($idx > 0) {
                 --$idx;
